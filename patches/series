@@ -170,6 +170,7 @@ helium/core/ublock-setup-sources.patch
 helium/core/ublock-install-as-component.patch
 helium/core/ublock-reconfigure-defaults.patch
 helium/core/ublock-helium-services.patch
+helium/core/devtools-mcp.patch
 helium/core/clean-omnibox-suggestions.patch
 helium/core/increase-incognito-storage-quota.patch
 
@@ -198,6 +199,7 @@ helium/core/browser-window-context-menu.patch
 helium/core/disable-ntp-footer.patch
 helium/core/tab-cycling-mru.patch
 helium/core/component-updates.patch
+helium/core/services-proxy-bases.patch
 helium/core/fixups-component-setup.patch
 helium/core/fixups-chrome-webstore-script.patch
 helium/core/hibernate-tab-context-menu.patch

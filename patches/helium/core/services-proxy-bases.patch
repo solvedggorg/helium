@@ -1,0 +1,70 @@
+--- a/components/helium_services/helium_services_helpers.h
++++ b/components/helium_services/helium_services_helpers.h
+@@ -17,6 +17,12 @@ const char kHeliumDefaultOrigin[] =
+ const char kHeliumDummyOrigin[] =
+     "https://helium-services-are-disabled.qjz9zk";
+ 
++// helium-services client paths. SERVICES_HOSTNAME is kHeliumDefaultOrigin.
++// PROXY_BASE_URL = {SERVICES_HOSTNAME}/ext
++// UBO_PROXY_BASE_URL = {SERVICES_HOSTNAME}/ubo/
++const char kHeliumExtProxyPath[] = "/ext";
++const char kHeliumUboProxyPath[] = "/ubo/";
++
+ bool ShouldAccessServices(const PrefService& prefs);
+ 
+ COMPONENT_EXPORT(HELIUM) bool ShouldFetchBangs(const PrefService& prefs);
+@@ -26,6 +32,8 @@ COMPONENT_EXPORT(HELIUM) bool ShouldAcce
+ COMPONENT_EXPORT(HELIUM) bool ShouldAccessUBlockAssets(const PrefService& prefs);
+ COMPONENT_EXPORT(HELIUM) GURL GetServicesBaseURL(const PrefService& prefs);
+ COMPONENT_EXPORT(HELIUM) GURL GetDummyURL();
++COMPONENT_EXPORT(HELIUM) GURL GetExtProxyBaseURL(const PrefService& prefs);
++COMPONENT_EXPORT(HELIUM) GURL GetUboProxyBaseURL(const PrefService& prefs);
+ COMPONENT_EXPORT(HELIUM) GURL GetExtensionUpdateURL(const PrefService& prefs);
+ COMPONENT_EXPORT(HELIUM) GURL GetWebstoreSnippetURL(const PrefService& prefs, std::string_view id);
+ COMPONENT_EXPORT(HELIUM) GURL GetSpellcheckURL(const PrefService& prefs);
+--- a/components/helium_services/helium_services_helpers.cc
++++ b/components/helium_services/helium_services_helpers.cc
+@@ -53,6 +53,14 @@ GURL GetDummyURL() {
+     return GURL(kHeliumDummyOrigin);
+ }
+ 
++GURL GetExtProxyBaseURL(const PrefService& prefs) {
++    return GetServicesBaseURL(prefs).Resolve(kHeliumExtProxyPath);
++}
++
++GURL GetUboProxyBaseURL(const PrefService& prefs) {
++    return GetServicesBaseURL(prefs).Resolve(kHeliumUboProxyPath);
++}
++
+ bool ShouldAccessServices(const PrefService& prefs) {
+     return prefs.GetBoolean(prefs::kHeliumServicesEnabled) &&
+            prefs.GetBoolean(prefs::kHeliumServicesConsented);
+@@ -80,7 +90,7 @@ GURL GetExtensionUpdateURL(const PrefSer
+         return GetDummyURL();
+     }
+ 
+-    return GetServicesBaseURL(prefs).Resolve("/ext");
++    return GetExtProxyBaseURL(prefs);
+ }
+ 
+ GURL GetWebstoreSnippetURL(const PrefService& prefs, std::string_view id) {
+@@ -88,8 +98,8 @@ GURL GetWebstoreSnippetURL(const PrefSer
+         return GetDummyURL();
+     }
+ 
+-    return GetServicesBaseURL(prefs).Resolve(
+-        base::StringPrintf("/ext/cws_snippet?id=%s", id));
++    return GetServicesBaseURL(prefs).Resolve(base::StringPrintf(
++        "%s/cws_snippet?id=%s", kHeliumExtProxyPath, id));
+ }
+ 
+ GURL GetSpellcheckURL(const PrefService& prefs) {
+@@ -149,7 +159,7 @@ GURL GetUBlockAssetsURL(const PrefServic
+         return GetDummyURL();
+     }
+ 
+-    return GetServicesBaseURL(prefs).Resolve("/ubo/assets.json");
++    return GetUboProxyBaseURL(prefs).Resolve("assets.json");
+ }
+ 
+ void ConfigurePrefChangeRegistrarFor(std::string_view pref_name,

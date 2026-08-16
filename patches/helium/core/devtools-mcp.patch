@@ -1,0 +1,1020 @@
+--- /dev/null
++++ b/chrome/browser/devtools/helium_mcp_server.h
+@@ -0,0 +1,18 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_DEVTOOLS_HELIUM_MCP_SERVER_H_
++#define CHROME_BROWSER_DEVTOOLS_HELIUM_MCP_SERVER_H_
++
++namespace helium {
++
++// Loopback MCP at http://127.0.0.1:17321/mcp. Runs inside the browser
++// process so Grok's helium-devtools plugin works without a second
++// Python/Node helper.
++void StartDevToolsMcp();
++void StopDevToolsMcp();
++
++}  // namespace helium
++
++#endif  // CHROME_BROWSER_DEVTOOLS_HELIUM_MCP_SERVER_H_
+--- /dev/null
++++ b/chrome/browser/devtools/helium_mcp_server.cc
+@@ -0,0 +1,948 @@
++// Copyright 2026 The Helium Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/devtools/helium_mcp_server.h"
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/functional/bind.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/logging.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/strings/string_util.h"
++#include "base/strings/stringprintf.h"
++#include "base/task/bind_post_task.h"
++#include "base/unguessable_token.h"
++#include "base/values.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_list.h"
++#include "chrome/browser/ui/browser_navigator.h"
++#include "chrome/browser/ui/browser_navigator_params.h"
++#include "chrome/browser/ui/browser_window.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "components/sessions/content/session_tab_helper.h"
++#include "content/public/browser/browser_task_traits.h"
++#include "content/public/browser/browser_thread.h"
++#include "content/public/browser/devtools_agent_host.h"
++#include "content/public/browser/devtools_agent_host_client.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/common/referrer.h"
++#include "content/public/browser/storage_partition.h"
++#include "content/public/browser/web_contents.h"
++#include "extensions/browser/disable_reason.h"
++#include "extensions/browser/extension_registrar.h"
++#include "extensions/browser/extension_registry.h"
++#include "extensions/common/extension.h"
++#include "extensions/common/extension_set.h"
++#include "net/base/ip_endpoint.h"
++#include "net/base/net_errors.h"
++#include "net/cookies/canonical_cookie.h"
++#include "net/log/net_log_source.h"
++#include "net/server/http_server.h"
++#include "net/server/http_server_request_info.h"
++#include "net/server/http_server_response_info.h"
++#include "net/socket/tcp_server_socket.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/network/public/mojom/cookie_manager.mojom.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/base/window_open_disposition.h"
++#include "url/gurl.h"
++
++namespace helium {
++namespace {
++
++constexpr uint16_t kMcpPort = 17321;
++constexpr char kBind[] = "127.0.0.1";
++
++constexpr net::NetworkTrafficAnnotationTag kTraffic =
++    net::DefineNetworkTrafficAnnotation(
++        "helium_devtools_mcp",
++        R"(
++      semantics {
++        sender: "Helium DevTools MCP"
++        description:
++          "Local JSON-RPC MCP for the Grok helium-devtools plugin."
++        trigger: "Helium browser start."
++        data: "Tab titles, URLs, cookies, and page eval results stay on loopback."
++        destination: LOCAL
++      }
++      policy {
++        cookies_allowed: NO
++        setting: "Always on. Binds 127.0.0.1 only."
++        policy_exception_justification: "Loopback automation for the local agent."
++      })");
++
++bool IsRestrictedUrl(const GURL& url) {
++  if (!url.is_valid()) {
++    return true;
++  }
++  const std::string spec = url.spec();
++  if (spec == "about:blank" || spec == "about:srcdoc") {
++    return false;
++  }
++  return url.SchemeIs("chrome") || url.SchemeIs("helium") ||
++         url.SchemeIs("devtools") || url.SchemeIs("chrome-extension") ||
++         url.SchemeIs("about");
++}
++
++std::string WriteJson(const base::Value& value) {
++  std::string out;
++  base::JSONWriter::Write(value, &out);
++  return out;
++}
++
++base::Value::Dict RpcResult(const base::Value& id, base::Value result) {
++  base::Value::Dict out;
++  out.Set("jsonrpc", "2.0");
++  out.Set("id", id.Clone());
++  out.Set("result", std::move(result));
++  return out;
++}
++
++base::Value::Dict RpcError(const base::Value& id,
++                           int code,
++                           std::string_view message) {
++  base::Value::Dict err;
++  err.Set("code", code);
++  err.Set("message", message);
++  base::Value::Dict out;
++  out.Set("jsonrpc", "2.0");
++  out.Set("id", id.Clone());
++  out.Set("error", std::move(err));
++  return out;
++}
++
++base::Value::Dict ToolContent(const base::Value& payload) {
++  std::string text =
++      payload.is_string() ? payload.GetString() : WriteJson(payload);
++  base::Value::Dict item;
++  item.Set("type", "text");
++  item.Set("text", std::move(text));
++  base::Value::List content;
++  content.Append(std::move(item));
++  base::Value::Dict result;
++  result.Set("content", std::move(content));
++  return result;
++}
++
++base::Value::Dict ToolError(std::string_view message) {
++  base::Value::Dict item;
++  item.Set("type", "text");
++  item.Set("text", message);
++  base::Value::List content;
++  content.Append(std::move(item));
++  base::Value::Dict result;
++  result.Set("content", std::move(content));
++  result.Set("isError", true);
++  return result;
++}
++
++base::Value::Dict ToolDef(std::string_view name,
++                          std::string_view description,
++                          base::Value::Dict properties,
++                          base::Value::List required) {
++  base::Value::Dict schema;
++  schema.Set("type", "object");
++  schema.Set("properties", std::move(properties));
++  if (!required.empty()) {
++    schema.Set("required", std::move(required));
++  }
++  base::Value::Dict tool;
++  tool.Set("name", name);
++  tool.Set("description", description);
++  tool.Set("inputSchema", std::move(schema));
++  return tool;
++}
++
++base::Value::Dict StringProp(std::string_view description) {
++  base::Value::Dict p;
++  p.Set("type", "string");
++  p.Set("description", description);
++  return p;
++}
++
++base::Value::Dict IntProp(std::string_view description) {
++  base::Value::Dict p;
++  p.Set("type", "integer");
++  p.Set("description", description);
++  return p;
++}
++
++base::Value::Dict BoolProp(std::string_view description) {
++  base::Value::Dict p;
++  p.Set("type", "boolean");
++  p.Set("description", description);
++  return p;
++}
++
++Profile* ActiveProfile() {
++  if (!g_browser_process || !g_browser_process->profile_manager()) {
++    return nullptr;
++  }
++  ProfileManager* pm = g_browser_process->profile_manager();
++  Profile* profile = pm->GetLastUsedProfileIfLoaded();
++  if (!profile) {
++    std::vector<Profile*> loaded = pm->GetLoadedProfiles();
++    if (!loaded.empty()) {
++      profile = loaded.front();
++    }
++  }
++  if (profile && profile->IsOffTheRecord()) {
++    profile = profile->GetOriginalProfile();
++  }
++  return profile;
++}
++
++struct TabRef {
++  raw_ptr<Browser> browser = nullptr;
++  raw_ptr<content::WebContents> contents = nullptr;
++  int index = -1;
++  int id = -1;
++};
++
++int TabIdFor(content::WebContents* contents) {
++  return sessions::SessionTabHelper::IdForTab(contents).id();
++}
++
++base::Value::Dict SerializeTab(content::WebContents* contents, bool active) {
++  base::Value::Dict tab;
++  tab.Set("id", TabIdFor(contents));
++  tab.Set("windowId", 0);
++  tab.Set("url", contents->GetLastCommittedURL().spec());
++  tab.Set("title", contents->GetTitle());
++  tab.Set("active", active);
++  tab.Set("status", contents->IsLoading() ? "loading" : "complete");
++  return tab;
++}
++
++std::optional<TabRef> FindTab(int tab_id) {
++  for (Browser* browser : *BrowserList::GetInstance()) {
++    TabStripModel* model = browser->tab_strip_model();
++    for (int i = 0; i < model->count(); ++i) {
++      content::WebContents* contents = model->GetWebContentsAt(i);
++      if (contents && TabIdFor(contents) == tab_id) {
++        return TabRef{browser, contents, i, tab_id};
++      }
++    }
++  }
++  return std::nullopt;
++}
++
++base::Value::Dict ListTabsPayload() {
++  base::Value::List tabs;
++  int attached = 0;
++  for (Browser* browser : *BrowserList::GetInstance()) {
++    TabStripModel* model = browser->tab_strip_model();
++    const int active = model->active_index();
++    for (int i = 0; i < model->count(); ++i) {
++      content::WebContents* contents = model->GetWebContentsAt(i);
++      if (!contents) {
++        continue;
++      }
++      if (content::DevToolsAgentHost::IsDebuggerAttached(contents)) {
++        ++attached;
++      }
++      tabs.Append(SerializeTab(contents, i == active));
++    }
++  }
++  base::Value::Dict out;
++  out.Set("tabs", std::move(tabs));
++  out.Set("attachedCount", attached);
++  return out;
++}
++
++class HeliumEvalClient : public content::DevToolsAgentHostClient {
++ public:
++  HeliumEvalClient(scoped_refptr<content::DevToolsAgentHost> host,
++                   base::OnceCallback<void(base::Value)> done)
++      : host_(std::move(host)), done_(std::move(done)) {}
++
++  bool Start(const std::string& message) {
++    if (!host_ || !host_->AttachClient(this)) {
++      if (done_) {
++        base::Value::Dict err;
++        err.Set("error", "attach_refused: restricted_url");
++        std::move(done_).Run(base::Value(std::move(err)));
++      }
++      return false;
++    }
++    host_->DispatchProtocolMessage(this, base::as_byte_span(message));
++    return true;
++  }
++
++  bool MayAttachToURL(const GURL& url, bool is_webui) override {
++    return !is_webui && !IsRestrictedUrl(url);
++  }
++  bool AllowUnsafeOperations() override { return true; }
++  std::string GetTypeForMetrics() override { return "Other"; }
++
++  void DispatchProtocolMessage(content::DevToolsAgentHost* agent_host,
++                               base::span<const uint8_t> message) override {
++    std::string_view json(reinterpret_cast<const char*>(message.data()),
++                          message.size());
++    std::optional<base::Value> parsed = base::JSONReader::Read(json);
++    Finish(parsed ? std::move(*parsed) : base::Value());
++  }
++
++  void AgentHostClosed(content::DevToolsAgentHost* agent_host) override {
++    Finish(base::Value());
++  }
++
++ private:
++  void Finish(base::Value value) {
++    if (host_) {
++      host_->DetachClient(this);
++      host_.reset();
++    }
++    if (done_) {
++      std::move(done_).Run(std::move(value));
++    }
++    delete this;
++  }
++
++  scoped_refptr<content::DevToolsAgentHost> host_;
++  base::OnceCallback<void(base::Value)> done_;
++};
++
++void DispatchCdp(content::WebContents* contents,
++                 const std::string& method,
++                 base::Value::Dict params,
++                 base::OnceCallback<void(base::Value)> done) {
++  auto host = content::DevToolsAgentHost::GetOrCreateFor(contents);
++  base::Value::Dict msg;
++  msg.Set("id", 1);
++  msg.Set("method", method);
++  msg.Set("params", std::move(params));
++  auto* client =
++      new HeliumEvalClient(std::move(host), std::move(done));
++  if (!client->Start(WriteJson(base::Value(std::move(msg))))) {
++    delete client;
++  }
++}
++
++base::Value ParseEvalResult(const base::Value& cdp) {
++  if (!cdp.is_dict()) {
++    return base::Value(ToolError("eval_failed: empty CDP result"));
++  }
++  const base::Value::Dict& dict = cdp.GetDict();
++  if (const std::string* err = dict.FindString("error")) {
++    return base::Value(ToolError(*err));
++  }
++  const base::Value::Dict* error = dict.FindDict("error");
++  if (error) {
++    const std::string* message = error->FindString("message");
++    return base::Value(ToolError(message ? *message : "eval_failed"));
++  }
++  const base::Value::Dict* result_wrap = dict.FindDict("result");
++  if (!result_wrap) {
++    return base::Value(
++        ToolError("eval_failed: missing Runtime.evaluate result"));
++  }
++  const base::Value::Dict* details = result_wrap->FindDict("exceptionDetails");
++  if (details) {
++    const base::Value::Dict* exc = details->FindDict("exception");
++    if (exc) {
++      if (const std::string* desc = exc->FindString("description")) {
++        return base::Value(ToolError(
++            base::StringPrintf("eval_failed: %s", desc->c_str())));
++      }
++    }
++    const std::string* text = details->FindString("text");
++    return base::Value(ToolError(base::StringPrintf(
++        "eval_failed: %s", text ? text->c_str() : "eval exception")));
++  }
++  const base::Value::Dict* remote = result_wrap->FindDict("result");
++  if (!remote) {
++    return base::Value(
++        ToolError("eval_failed: missing Runtime.evaluate result"));
++  }
++  base::Value::Dict out;
++  if (const std::string* type = remote->FindString("type")) {
++    out.Set("type", *type);
++  }
++  if (const base::Value* value = remote->Find("value")) {
++    out.Set("result", value->Clone());
++  } else {
++    out.Set("result", base::Value());
++  }
++  return base::Value(ToolContent(base::Value(std::move(out))));
++}
++
++using Reply = base::OnceCallback<void(base::Value::Dict)>;
++
++void ReplyTool(Reply reply, const base::Value& id, base::Value::Dict payload) {
++  std::move(reply).Run(RpcResult(id, std::move(payload)));
++}
++
++void HandleEval(int tab_id,
++                const std::string& expression,
++                const base::Value& id,
++                Reply reply) {
++  std::optional<TabRef> tab = FindTab(tab_id);
++  if (!tab) {
++    ReplyTool(std::move(reply), id, ToolError("unknown tab"));
++    return;
++  }
++  if (IsRestrictedUrl(tab->contents->GetLastCommittedURL())) {
++    ReplyTool(std::move(reply), id, ToolError("attach_refused: restricted_url"));
++    return;
++  }
++  base::Value::Dict params;
++  params.Set("expression", expression);
++  params.Set("returnByValue", true);
++  params.Set("awaitPromise", true);
++  DispatchCdp(
++      tab->contents, "Runtime.evaluate", std::move(params),
++      base::BindOnce(
++          [](base::Value id, Reply reply, base::Value cdp) {
++            base::Value parsed = ParseEvalResult(cdp);
++            ReplyTool(std::move(reply), id, std::move(parsed).TakeDict());
++          },
++          id.Clone(), std::move(reply)));
++}
++
++void HandleCookies(const std::string& domain,
++                   const base::Value& id,
++                   Reply reply) {
++  Profile* profile = ActiveProfile();
++  if (!profile) {
++    ReplyTool(std::move(reply), id, ToolError("no_profile"));
++    return;
++  }
++  network::mojom::CookieManager* manager =
++      profile->GetDefaultStoragePartition()->GetCookieManagerForBrowserProcess();
++  if (!manager) {
++    ReplyTool(std::move(reply), id, ToolError("no_cookie_manager"));
++    return;
++  }
++  manager->GetAllCookies(base::BindOnce(
++      [](std::string domain, base::Value id, Reply reply,
++         const std::vector<net::CanonicalCookie>& cookies) {
++        base::Value::List list;
++        for (const net::CanonicalCookie& cookie : cookies) {
++          std::string host = cookie.Domain();
++          if (base::StartsWith(host, ".")) {
++            host = host.substr(1);
++          }
++          if (host != domain && !base::EndsWith(host, "." + domain) &&
++              !base::EndsWith(domain, "." + host)) {
++            continue;
++          }
++          base::Value::Dict item;
++          item.Set("name", cookie.Name());
++          item.Set("value", cookie.Value());
++          item.Set("domain", cookie.Domain());
++          item.Set("path", cookie.Path());
++          item.Set("secure", cookie.SecureAttribute());
++          item.Set("httpOnly", cookie.IsHttpOnly());
++          list.Append(std::move(item));
++        }
++        base::Value::Dict payload;
++        payload.Set("cookies", std::move(list));
++        ReplyTool(std::move(reply), id,
++                  ToolContent(base::Value(std::move(payload))));
++      },
++      domain, id.Clone(), std::move(reply)));
++}
++
++void CallTool(const std::string& name,
++              const base::Value::Dict& args,
++              const base::Value& id,
++              Reply reply) {
++  if (name == "helium_status") {
++    base::Value::Dict listed = ListTabsPayload();
++    const base::Value::List* tabs = listed.FindList("tabs");
++    base::Value::Dict status;
++    status.Set("connected", true);
++    status.Set("tabs", tabs ? static_cast<int>(tabs->size()) : 0);
++    status.Set("attached", base::Value::List());
++    status.Set("lastError", "");
++    status.Set("inspectEnabled", false);
++    status.Set("remoteDebuggingPref", false);
++    status.Set("inspectUrl", "helium://inspect/#remote-debugging");
++    status.Set("attachPath", "in-process");
++    ReplyTool(std::move(reply), id, ToolContent(base::Value(std::move(status))));
++    return;
++  }
++
++  if (name == "helium_list_tabs" || name == "list_pages") {
++    ReplyTool(std::move(reply), id,
++              ToolContent(base::Value(ListTabsPayload())));
++    return;
++  }
++
++  if (name == "helium_new_tab") {
++    Profile* profile = ActiveProfile();
++    if (!profile) {
++      ReplyTool(std::move(reply), id, ToolError("no_profile"));
++      return;
++    }
++    std::string url = "about:blank";
++    if (const std::string* raw = args.FindString("url")) {
++      url = *raw;
++    }
++    NavigateParams params(profile, GURL(url), ui::PAGE_TRANSITION_FROM_API);
++    params.disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++    Navigate(&params);
++    base::Value::Dict tab;
++    if (params.navigated_or_inserted_contents) {
++      tab = SerializeTab(params.navigated_or_inserted_contents, true);
++    }
++    base::Value::Dict payload;
++    payload.Set("tab", std::move(tab));
++    ReplyTool(std::move(reply), id,
++              ToolContent(base::Value(std::move(payload))));
++    return;
++  }
++
++  if (name == "select_page" || name == "helium_activate_tab") {
++    const std::optional<int> tab_id = args.FindInt("tabId");
++    if (!tab_id) {
++      ReplyTool(std::move(reply), id, ToolError("tabId required"));
++      return;
++    }
++    std::optional<TabRef> tab = FindTab(*tab_id);
++    if (!tab) {
++      ReplyTool(std::move(reply), id, ToolError("unknown tab"));
++      return;
++    }
++    tab->browser->tab_strip_model()->ActivateTabAt(tab->index);
++    if (tab->browser->window()) {
++      tab->browser->window()->Show();
++    }
++    ReplyTool(std::move(reply), id, ToolContent(base::Value(base::Value::Dict())));
++    return;
++  }
++
++  if (name == "navigate_page") {
++    const std::optional<int> tab_id = args.FindInt("tabId");
++    const std::string* url = args.FindString("url");
++    if (!tab_id || !url) {
++      ReplyTool(std::move(reply), id, ToolError("tabId and url required"));
++      return;
++    }
++    std::optional<TabRef> tab = FindTab(*tab_id);
++    if (!tab) {
++      ReplyTool(std::move(reply), id, ToolError("unknown tab"));
++      return;
++    }
++    tab->contents->GetController().LoadURL(GURL(*url), content::Referrer(),
++                                           ui::PAGE_TRANSITION_FROM_API,
++                                           std::string());
++    ReplyTool(std::move(reply), id,
++              ToolContent(base::Value(SerializeTab(tab->contents, true))));
++    return;
++  }
++
++  if (name == "helium_eval" || name == "evaluate_script") {
++    const std::optional<int> tab_id = args.FindInt("tabId");
++    const std::string* expression = args.FindString("expression");
++    if (!expression) {
++      expression = args.FindString("function");
++    }
++    if (!tab_id || !expression) {
++      ReplyTool(std::move(reply), id,
++                ToolError("tabId and expression required"));
++      return;
++    }
++    HandleEval(*tab_id, *expression, id, std::move(reply));
++    return;
++  }
++
++  if (name == "take_snapshot") {
++    const std::optional<int> tab_id = args.FindInt("tabId");
++    if (!tab_id) {
++      ReplyTool(std::move(reply), id, ToolError("tabId required"));
++      return;
++    }
++    HandleEval(*tab_id,
++               "document.documentElement ? "
++               "document.documentElement.outerHTML.slice(0, 80000) : ''",
++               id, std::move(reply));
++    return;
++  }
++
++  if (name == "helium_get_cookies") {
++    const std::string* domain = args.FindString("domain");
++    if (!domain) {
++      ReplyTool(std::move(reply), id, ToolError("domain required"));
++      return;
++    }
++    HandleCookies(*domain, id, std::move(reply));
++    return;
++  }
++
++  if (name == "helium_list_extensions") {
++    Profile* profile = ActiveProfile();
++    if (!profile) {
++      ReplyTool(std::move(reply), id, ToolError("no_profile"));
++      return;
++    }
++    auto* registry = extensions::ExtensionRegistry::Get(profile);
++    base::Value::List list;
++    auto append = [&](const extensions::ExtensionSet& set, bool enabled) {
++      for (const auto& extension : set) {
++        base::Value::Dict item;
++        item.Set("id", extension->id());
++        item.Set("name", extension->name());
++        item.Set("enabled", enabled);
++        list.Append(std::move(item));
++      }
++    };
++    append(registry->enabled_extensions(), true);
++    append(registry->disabled_extensions(), false);
++    append(registry->terminated_extensions(), false);
++    base::Value::Dict payload;
++    payload.Set("extensions", std::move(list));
++    ReplyTool(std::move(reply), id,
++              ToolContent(base::Value(std::move(payload))));
++    return;
++  }
++
++  if (name == "helium_set_extension_enabled") {
++    const std::string* ext_id = args.FindString("id");
++    const std::optional<bool> enabled = args.FindBool("enabled");
++    if (!ext_id || !enabled) {
++      ReplyTool(std::move(reply), id, ToolError("id and enabled required"));
++      return;
++    }
++    Profile* profile = ActiveProfile();
++    if (!profile) {
++      ReplyTool(std::move(reply), id, ToolError("no_profile"));
++      return;
++    }
++    auto* registrar = extensions::ExtensionRegistrar::Get(profile);
++    if (*enabled) {
++      registrar->EnableExtension(*ext_id);
++    } else {
++      registrar->DisableExtension(
++          *ext_id, {extensions::disable_reason::DISABLE_USER_ACTION});
++    }
++    base::Value::Dict payload;
++    payload.Set("id", *ext_id);
++    payload.Set("enabled", *enabled);
++    ReplyTool(std::move(reply), id,
++              ToolContent(base::Value(std::move(payload))));
++    return;
++  }
++
++  if (name == "helium_set_request_intercept") {
++    const std::optional<int> tab_id = args.FindInt("tabId");
++    const std::optional<bool> enabled = args.FindBool("enabled");
++    if (!tab_id || !enabled) {
++      ReplyTool(std::move(reply), id, ToolError("tabId and enabled required"));
++      return;
++    }
++    std::optional<TabRef> tab = FindTab(*tab_id);
++    if (!tab) {
++      ReplyTool(std::move(reply), id, ToolError("unknown tab"));
++      return;
++    }
++    if (IsRestrictedUrl(tab->contents->GetLastCommittedURL())) {
++      ReplyTool(std::move(reply), id,
++                ToolError("attach_refused: restricted_url"));
++      return;
++    }
++    base::Value::Dict params;
++    if (*enabled) {
++      base::Value::List patterns;
++      base::Value::Dict pattern;
++      pattern.Set("urlPattern", "*");
++      patterns.Append(std::move(pattern));
++      params.Set("patterns", std::move(patterns));
++    }
++    DispatchCdp(
++        tab->contents, *enabled ? "Fetch.enable" : "Fetch.disable",
++        std::move(params),
++        base::BindOnce(
++            [](base::Value id, Reply reply, bool enabled, base::Value) {
++              base::Value::Dict payload;
++              payload.Set("enabled", enabled);
++              ReplyTool(std::move(reply), id,
++                        ToolContent(base::Value(std::move(payload))));
++            },
++            id.Clone(), std::move(reply), *enabled));
++    return;
++  }
++
++  ReplyTool(std::move(reply), id,
++            ToolError(base::StringPrintf("unknown tool: %s", name.c_str())));
++}
++
++base::Value::List ToolList() {
++  base::Value::List tools;
++  tools.Append(ToolDef("helium_status",
++                       "Connection state of the daily Helium window.",
++                       base::Value::Dict(), base::Value::List()));
++  tools.Append(ToolDef("helium_list_tabs",
++                       "List tabs in the connected Helium window.",
++                       base::Value::Dict(), base::Value::List()));
++  tools.Append(ToolDef("list_pages", "List tabs. Prefer helium_list_tabs.",
++                       base::Value::Dict(), base::Value::List()));
++
++  base::Value::Dict new_tab_props;
++  new_tab_props.Set("url", StringProp("URL to open. Defaults to about:blank."));
++  tools.Append(ToolDef("helium_new_tab",
++                       "Open a tab. Use this before page tools if every tab "
++                       "is helium:// or chrome://.",
++                       std::move(new_tab_props), base::Value::List()));
++
++  base::Value::Dict tab_props;
++  tab_props.Set("tabId", IntProp("Tab id from helium_list_tabs."));
++  base::Value::List tab_req;
++  tab_req.Append("tabId");
++  tools.Append(ToolDef("select_page", "Activate a tab.", tab_props.Clone(),
++                       tab_req.Clone()));
++
++  base::Value::Dict nav_props = tab_props.Clone();
++  nav_props.Set("url", StringProp("URL to load."));
++  base::Value::List nav_req = tab_req.Clone();
++  nav_req.Append("url");
++  tools.Append(ToolDef("navigate_page", "Navigate a tab.", std::move(nav_props),
++                       std::move(nav_req)));
++
++  base::Value::Dict eval_props = tab_props.Clone();
++  eval_props.Set("expression", StringProp("JavaScript to evaluate."));
++  base::Value::List eval_req = tab_req.Clone();
++  eval_req.Append("expression");
++  tools.Append(ToolDef("helium_eval",
++                       "Evaluate JavaScript via CDP Runtime.evaluate.",
++                       eval_props.Clone(), eval_req.Clone()));
++  tools.Append(ToolDef("evaluate_script",
++                       "Evaluate JavaScript in a tab. Alias of helium_eval.",
++                       std::move(eval_props), std::move(eval_req)));
++  tools.Append(ToolDef("take_snapshot",
++                       "HTML snapshot of a tab (outerHTML, truncated).",
++                       tab_props.Clone(), tab_req.Clone()));
++
++  base::Value::Dict cookie_props;
++  cookie_props.Set("domain", StringProp("Cookie domain, e.g. example.com."));
++  base::Value::List cookie_req;
++  cookie_req.Append("domain");
++  tools.Append(ToolDef("helium_get_cookies",
++                       "Read cookies for a domain from daily Helium.",
++                       std::move(cookie_props), std::move(cookie_req)));
++
++  tools.Append(ToolDef("helium_list_extensions",
++                       "List installed Helium extensions.",
++                       base::Value::Dict(), base::Value::List()));
++
++  base::Value::Dict ext_props;
++  ext_props.Set("id", StringProp("Extension id."));
++  ext_props.Set("enabled",
++                BoolProp("Whether the extension should be enabled."));
++  base::Value::List ext_req;
++  ext_req.Append("id");
++  ext_req.Append("enabled");
++  tools.Append(ToolDef("helium_set_extension_enabled",
++                       "Enable or disable an installed extension by id.",
++                       std::move(ext_props), std::move(ext_req)));
++
++  base::Value::Dict intercept_props = tab_props.Clone();
++  intercept_props.Set(
++      "enabled", BoolProp("Enable or disable Fetch interception."));
++  base::Value::List intercept_req = tab_req.Clone();
++  intercept_req.Append("enabled");
++  tools.Append(ToolDef("helium_set_request_intercept",
++                       "Enable or disable Fetch interception on a tab.",
++                       std::move(intercept_props), std::move(intercept_req)));
++  return tools;
++}
++
++void DispatchMcpOnUI(std::string body, Reply reply) {
++  std::optional<base::Value> parsed = base::JSONReader::Read(body);
++  if (!parsed || !parsed->is_dict()) {
++    std::move(reply).Run(RpcError(base::Value(), -32700, "parse error"));
++    return;
++  }
++  const base::Value::Dict& req = parsed->GetDict();
++  const std::string* method = req.FindString("method");
++  const base::Value* id = req.Find("id");
++  const base::Value empty_id;
++  const base::Value& rpc_id = id ? *id : empty_id;
++  if (!method) {
++    std::move(reply).Run(RpcError(rpc_id, -32600, "missing method"));
++    return;
++  }
++  if (*method == "notifications/initialized" ||
++      *method == "notifications/cancelled") {
++    std::move(reply).Run(base::Value::Dict());
++    return;
++  }
++  if (*method == "initialize") {
++    std::string version = "2024-11-05";
++    if (const base::Value::Dict* params = req.FindDict("params")) {
++      if (const std::string* pv = params->FindString("protocolVersion")) {
++        version = *pv;
++      }
++    }
++    base::Value::Dict caps;
++    caps.Set("tools", base::Value::Dict());
++    base::Value::Dict info;
++    info.Set("name", "helium-devtools");
++    info.Set("version", "0.1.0");
++    base::Value::Dict result;
++    result.Set("protocolVersion", version);
++    result.Set("capabilities", std::move(caps));
++    result.Set("serverInfo", std::move(info));
++    std::move(reply).Run(RpcResult(rpc_id, std::move(result)));
++    return;
++  }
++  if (*method == "ping") {
++    std::move(reply).Run(RpcResult(rpc_id, base::Value::Dict()));
++    return;
++  }
++  if (*method == "tools/list") {
++    base::Value::Dict result;
++    result.Set("tools", ToolList());
++    std::move(reply).Run(RpcResult(rpc_id, std::move(result)));
++    return;
++  }
++  if (*method == "tools/call") {
++    const base::Value::Dict* params = req.FindDict("params");
++    const std::string* name = params ? params->FindString("name") : nullptr;
++    if (!name) {
++      std::move(reply).Run(RpcError(rpc_id, -32602, "missing tool name"));
++      return;
++    }
++    const base::Value::Dict* args = params->FindDict("arguments");
++    static const base::Value::Dict kEmptyArgs;
++    CallTool(*name, args ? *args : kEmptyArgs, rpc_id, std::move(reply));
++    return;
++  }
++  std::move(reply).Run(RpcError(rpc_id, -32601, "method not found"));
++}
++
++class HeliumMcpServer : public net::HttpServer::Delegate {
++ public:
++  HeliumMcpServer()
++      : session_id_(base::UnguessableToken::Create().ToString()) {}
++
++  void Start() {
++    auto socket =
++        std::make_unique<net::TCPServerSocket>(nullptr, net::NetLogSource());
++    const int rv = socket->ListenWithAddressAndPort(kBind, kMcpPort, 8);
++    if (rv != net::OK) {
++      LOG(ERROR) << "Helium MCP listen " << kBind << ":" << kMcpPort
++                 << " failed: " << net::ErrorToShortString(rv);
++      return;
++    }
++    server_ = std::make_unique<net::HttpServer>(std::move(socket), this);
++    LOG(INFO) << "Helium MCP listening on http://" << kBind << ":" << kMcpPort
++              << "/mcp";
++  }
++
++  void OnConnect(int connection_id) override {}
++
++  void OnHttpRequest(int connection_id,
++                     const net::HttpServerRequestInfo& info) override {
++    if (!info.peer.address().IsLoopback()) {
++      server_->Send404(connection_id, kTraffic);
++      return;
++    }
++    if (info.method == "OPTIONS") {
++      net::HttpServerResponseInfo response(net::HTTP_NO_CONTENT);
++      AddCors(&response);
++      server_->SendResponse(connection_id, response, kTraffic);
++      return;
++    }
++    const bool mcp_path =
++        info.path == "/mcp" || base::StartsWith(info.path, "/mcp?");
++    if (!mcp_path) {
++      server_->Send404(connection_id, kTraffic);
++      return;
++    }
++    if (info.method == "GET") {
++      SendJson(connection_id,
++               R"({"ok":true,"server":"helium-devtools","attachPath":"in-process"})");
++      return;
++    }
++    if (info.method != "POST") {
++      server_->Send404(connection_id, kTraffic);
++      return;
++    }
++    content::GetUIThreadTaskRunner({})->PostTask(
++        FROM_HERE,
++        base::BindOnce(
++            &DispatchMcpOnUI, info.data,
++            base::BindPostTask(content::GetIOThreadTaskRunner({}),
++                               base::BindOnce(&HeliumMcpServer::OnRpcReady,
++                                              weak_factory_.GetWeakPtr(),
++                                              connection_id))));
++  }
++
++  void OnWebSocketRequest(int connection_id,
++                          const net::HttpServerRequestInfo& info) override {
++    server_->Close(connection_id);
++  }
++  void OnWebSocketMessage(int connection_id, std::string data) override {}
++  void OnClose(int connection_id) override {}
++
++ private:
++  void AddCors(net::HttpServerResponseInfo* response) {
++    response->AddHeader("Access-Control-Allow-Origin", "*");
++    response->AddHeader("Access-Control-Allow-Headers",
++                        "content-type, accept, mcp-session-id");
++    response->AddHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
++    response->AddHeader("mcp-session-id", session_id_);
++  }
++
++  void SendJson(int connection_id, std::string_view body) {
++    net::HttpServerResponseInfo response(net::HTTP_OK);
++    AddCors(&response);
++    response.SetBody(body, "application/json");
++    server_->SendResponse(connection_id, response, kTraffic);
++  }
++
++  void OnRpcReady(int connection_id, base::Value::Dict rpc) {
++    if (!server_) {
++      return;
++    }
++    if (rpc.empty()) {
++      net::HttpServerResponseInfo response(net::HTTP_ACCEPTED);
++      AddCors(&response);
++      server_->SendResponse(connection_id, response, kTraffic);
++      return;
++    }
++    SendJson(connection_id, WriteJson(base::Value(std::move(rpc))));
++  }
++
++  std::string session_id_;
++  std::unique_ptr<net::HttpServer> server_;
++  base::WeakPtrFactory<HeliumMcpServer> weak_factory_{this};
++};
++
++std::unique_ptr<HeliumMcpServer> g_server;
++
++}  // namespace
++
++void StartDevToolsMcp() {
++  content::GetIOThreadTaskRunner({})->PostTask(FROM_HERE, base::BindOnce([] {
++                                                 if (g_server) {
++                                                   return;
++                                                 }
++                                                 g_server =
++                                                     std::make_unique<
++                                                         HeliumMcpServer>();
++                                                 g_server->Start();
++                                               }));
++}
++
++void StopDevToolsMcp() {
++  content::GetIOThreadTaskRunner({})->PostTask(
++      FROM_HERE, base::BindOnce([] { g_server.reset(); }));
++}
++
++}  // namespace helium
+--- a/chrome/browser/devtools/BUILD.gn
++++ b/chrome/browser/devtools/BUILD.gn
+@@ -348,6 +348,8 @@ static_library("devtools") {
+       "devtools_ui_controller.cc",
+       "devtools_ui_controller.h",
+       "devtools_window_views.cc",
++      "helium_mcp_server.cc",
++      "helium_mcp_server.h",
+       "process_sharing_infobar_delegate.cc",
+       "process_sharing_infobar_delegate.h",
+       "remote_debugging_server.cc",
+@@ -404,6 +406,7 @@ static_library("devtools") {
+       "//components/search_engines",
+       "//components/services/app_service",
+       "//components/sessions",
++      "//components/sessions/content",
+       "//components/signin/public/identity_manager",
+       "//components/sync/service",
+       "//components/sync_preferences",
+--- a/chrome/browser/browser_process_impl.cc
++++ b/chrome/browser/browser_process_impl.cc
+@@ -52,6 +52,7 @@
+ #include "chrome/browser/controlled_frame/controlled_frame_extensions_browser_api_provider.h"
+ #include "chrome/browser/defaults.h"
++#include "chrome/browser/devtools/helium_mcp_server.h"
+ #include "chrome/browser/devtools/remote_debugging_server.h"
+ #include "chrome/browser/download/download_request_limiter.h"
+ #include "chrome/browser/download/download_status_updater.h"
+ #include "chrome/browser/global_features.h"
+@@ -747,6 +748,7 @@ void BrowserProcessImpl::StartTearDown()
+   }
+ 
+   // Debugger must be cleaned up before ProfileManager.
++  helium::StopDevToolsMcp();
+   remote_debugging_server_.reset();
+   devtools_auto_opener_.reset();
+ 
+@@ -1662,6 +1664,10 @@ void BrowserProcessImpl::PreMainMessageL
+   soda_installer_impl_ = std::make_unique<speech::SodaInstallerImplChromeOS>();
+ #endif  // BUILDFLAG(IS_CHROMEOS)
+ 
++#if !BUILDFLAG(IS_ANDROID)
++  helium::StartDevToolsMcp();
++#endif
++
+   base::FilePath user_data_dir;
+   bool result = base::PathService::Get(chrome::DIR_USER_DATA, &user_data_dir);
+   DCHECK(result);
