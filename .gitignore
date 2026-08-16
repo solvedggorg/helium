@@ -11,6 +11,8 @@ __pycache__/
 
 # Ignore optional build / cache directory
 /build
+/result
+/result-*
 
 # Ignore generated resources
 /resources/generated

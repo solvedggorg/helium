@@ -47,6 +47,7 @@ runs:
         export version_before
 
         pushd "$HELIUM_DIR"
+          git remote set-url origin https://github.com/solvedggorg/helium.git
           git fetch origin main
           git checkout origin/main
         popd
@@ -104,7 +105,7 @@ runs:
         TITLE="update: helium $version_after"
 
         git config user.name "helium-bot"
-        git config user.email "helium-bot@imput.net"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
         git add -u patches helium-chromium revision.txt
 
         PLATFORM_HOOK="$PLATFORM_DIR/.github/bump-hook.sh"

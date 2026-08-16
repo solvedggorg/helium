@@ -13,7 +13,13 @@ jobs:
     steps:
       - name: Clone repository
         uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
+
+      - name: Point origin at solvedggorg/helium
+        run: |
+          git remote set-url origin https://github.com/solvedggorg/helium.git
+          git remote -v
 
       - name: Check if a new release is needed
         id: info
