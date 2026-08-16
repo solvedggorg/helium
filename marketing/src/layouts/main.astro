@@ -1,0 +1,65 @@
+---
+import "@/styles/global.css"
+
+interface Props {
+  title?: string
+  description?: string
+}
+
+const title = Astro.props.title ?? "Bob — a Helium fork"
+const description =
+  Astro.props.description ??
+  "Bob is Helium with our own services and an always-on agent port in the daily window. Privacy-first Chromium. No extra browser."
+const site = "https://bob.solved.gg"
+const canonical = new URL(Astro.url.pathname, site).href
+const ogImage = new URL("/og.svg", site).href
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="apple-touch-icon" href="/favicon.svg" />
+    <link rel="canonical" href={canonical} />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta name="theme-color" content="#1E3D3A" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:site_name" content="Bob" />
+    <meta property="og:image" content={ogImage} />
+    <meta property="og:image:alt" content="A red diner nametag that says BOB" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImage} />
+  </head>
+  <body>
+    <a class="skip" href="#content">Skip to content</a>
+    <slot />
+  </body>
+</html>
+
+<style is:global>
+  .skip {
+    position: absolute;
+    left: 0.75rem;
+    top: 0.75rem;
+    z-index: 20;
+    transform: translateY(-160%);
+    padding: 0.45rem 0.7rem;
+    background: var(--ticket);
+    color: var(--ink);
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    text-decoration: none;
+  }
+
+  .skip:focus {
+    transform: none;
+  }
+</style>

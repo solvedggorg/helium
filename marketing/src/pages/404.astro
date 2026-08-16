@@ -1,0 +1,81 @@
+---
+import Layout from "@/layouts/main.astro"
+import SiteHeader from "@/components/SiteHeader.astro"
+import SiteFooter from "@/components/SiteFooter.astro"
+---
+
+<Layout
+  title="That seat is empty — Bob"
+  description="This page is not on the ticket. Head back to the Bob counter."
+>
+  <div class="page">
+    <div class="rail" aria-hidden="true"></div>
+    <div class="sheet">
+      <SiteHeader />
+      <main id="content" class="miss">
+        <p class="eyebrow">404</p>
+        <h1>That seat is empty.</h1>
+        <p>Nothing is plated at this URL. The counter is one page.</p>
+        <a class="btn" href="/">Back to Bob</a>
+      </main>
+      <SiteFooter />
+    </div>
+  </div>
+</Layout>
+
+<style>
+  .page {
+    min-height: 100svh;
+    background: var(--formica);
+    color: var(--counter);
+  }
+
+  .rail {
+    height: 0.55rem;
+    background: linear-gradient(90deg, #8a9694, var(--chrome), #6f7b79);
+  }
+
+  .sheet {
+    width: min(68rem, calc(100% - 2rem));
+    margin: 1.2rem auto 2.5rem;
+    padding: 0.4rem 1.4rem 0;
+    background: var(--counter);
+    color: var(--ink);
+    border: 1px solid rgb(20 32 31 / 0.18);
+  }
+
+  .miss {
+    padding: 3rem 0 4rem;
+    max-width: 32rem;
+  }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted-foreground);
+  }
+
+  h1 {
+    margin: 0 0 0.7rem;
+    font-family: var(--font-display);
+    font-weight: 800;
+    font-size: clamp(2.4rem, 8vw, 4rem);
+    line-height: 0.92;
+  }
+
+  .btn {
+    display: inline-flex;
+    margin-top: 1.2rem;
+    min-height: 2.6rem;
+    padding: 0.45rem 1rem 0.35rem;
+    background: var(--badge);
+    color: #fff8f0;
+    font-family: var(--font-display);
+    font-size: 1.15rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-decoration: none;
+    text-transform: uppercase;
+  }
+</style>
