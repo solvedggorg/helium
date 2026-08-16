@@ -1,6 +1,6 @@
 --- a/components/helium_services/helium_services_helpers.h
 +++ b/components/helium_services/helium_services_helpers.h
-@@ -17,6 +17,12 @@ const char kHeliumDefaultOrigin[] =
+@@ -18,6 +18,12 @@ const char kHeliumDefaultOrigin[] =
  const char kHeliumDummyOrigin[] =
      "https://helium-services-are-disabled.qjz9zk";
  
@@ -13,7 +13,7 @@
  bool ShouldAccessServices(const PrefService& prefs);
  
  COMPONENT_EXPORT(HELIUM) bool ShouldFetchBangs(const PrefService& prefs);
-@@ -26,6 +32,8 @@ COMPONENT_EXPORT(HELIUM) bool ShouldAcce
+@@ -27,6 +33,8 @@ COMPONENT_EXPORT(HELIUM) bool ShouldAcce
  COMPONENT_EXPORT(HELIUM) bool ShouldAccessUBlockAssets(const PrefService& prefs);
  COMPONENT_EXPORT(HELIUM) GURL GetServicesBaseURL(const PrefService& prefs);
  COMPONENT_EXPORT(HELIUM) GURL GetDummyURL();
@@ -24,7 +24,7 @@
  COMPONENT_EXPORT(HELIUM) GURL GetSpellcheckURL(const PrefService& prefs);
 --- a/components/helium_services/helium_services_helpers.cc
 +++ b/components/helium_services/helium_services_helpers.cc
-@@ -53,6 +53,14 @@ GURL GetDummyURL() {
+@@ -77,6 +77,14 @@ GURL GetDummyURL() {
      return GURL(kHeliumDummyOrigin);
  }
  
@@ -39,7 +39,7 @@
  bool ShouldAccessServices(const PrefService& prefs) {
      return prefs.GetBoolean(prefs::kHeliumServicesEnabled) &&
             prefs.GetBoolean(prefs::kHeliumServicesConsented);
-@@ -80,7 +90,7 @@ GURL GetExtensionUpdateURL(const PrefSer
+@@ -118,7 +126,7 @@ GURL GetExtensionUpdateURL(const PrefSer
          return GetDummyURL();
      }
  
@@ -48,7 +48,7 @@
  }
  
  GURL GetWebstoreSnippetURL(const PrefService& prefs, std::string_view id) {
-@@ -88,8 +98,8 @@ GURL GetWebstoreSnippetURL(const PrefSer
+@@ -126,8 +134,8 @@ GURL GetWebstoreSnippetURL(const PrefSer
          return GetDummyURL();
      }
  
@@ -59,7 +59,7 @@
  }
  
  GURL GetSpellcheckURL(const PrefService& prefs) {
-@@ -149,7 +159,7 @@ GURL GetUBlockAssetsURL(const PrefServic
+@@ -169,7 +177,7 @@ GURL GetUBlockAssetsURL(const PrefServic
          return GetDummyURL();
      }
  

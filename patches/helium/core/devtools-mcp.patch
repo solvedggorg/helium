@@ -972,7 +972,15 @@
 +}  // namespace helium
 --- a/chrome/browser/devtools/BUILD.gn
 +++ b/chrome/browser/devtools/BUILD.gn
-@@ -348,6 +348,8 @@ static_library("devtools") {
+@@ -284,6 +284,7 @@ static_library("devtools") {
+       "//components/search_engines",
+       "//components/services/app_service",
+       "//components/sessions",
++      "//components/sessions/content",
+       "//components/signin/public/identity_manager",
+       "//components/sync/service",
+       "//components/sync_preferences",
+@@ -358,6 +359,8 @@ static_library("devtools") {
        "devtools_ui_controller.cc",
        "devtools_ui_controller.h",
        "devtools_window_views.cc",
@@ -981,17 +989,9 @@
        "process_sharing_infobar_delegate.cc",
        "process_sharing_infobar_delegate.h",
        "remote_debugging_server.cc",
-@@ -404,6 +406,7 @@ static_library("devtools") {
-       "//components/search_engines",
-       "//components/services/app_service",
-       "//components/sessions",
-+      "//components/sessions/content",
-       "//components/signin/public/identity_manager",
-       "//components/sync/service",
-       "//components/sync_preferences",
 --- a/chrome/browser/browser_process_impl.cc
 +++ b/chrome/browser/browser_process_impl.cc
-@@ -52,6 +52,7 @@
+@@ -54,6 +54,7 @@
  #include "chrome/browser/controlled_frame/controlled_frame_extensions_browser_api_provider.h"
  #include "chrome/browser/defaults.h"
 +#include "chrome/browser/devtools/helium_mcp_server.h"
@@ -999,22 +999,22 @@
  #include "chrome/browser/download/download_request_limiter.h"
  #include "chrome/browser/download/download_status_updater.h"
  #include "chrome/browser/global_features.h"
-@@ -747,6 +748,7 @@ void BrowserProcessImpl::StartTearDown()
-   }
+@@ -639,6 +640,7 @@ void BrowserProcessImpl::StartTearDown()
  
    // Debugger must be cleaned up before ProfileManager.
 +  helium::StopDevToolsMcp();
    remote_debugging_server_.reset();
    devtools_auto_opener_.reset();
  
-@@ -1662,6 +1664,10 @@ void BrowserProcessImpl::PreMainMessageL
+   battery_metrics_.reset();
+@@ -1678,7 +1680,10 @@ void BrowserProcessImpl::PreMainMessageL
    soda_installer_impl_ = std::make_unique<speech::SodaInstallerImplChromeOS>();
  #endif  // BUILDFLAG(IS_CHROMEOS)
+ 
  
 +#if !BUILDFLAG(IS_ANDROID)
 +  helium::StartDevToolsMcp();
 +#endif
-+
    base::FilePath user_data_dir;
    bool result = base::PathService::Get(chrome::DIR_USER_DATA, &user_data_dir);
    DCHECK(result);
